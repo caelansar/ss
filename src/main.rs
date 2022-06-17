@@ -1,16 +1,12 @@
-mod rc4;
-mod stream;
-
 use byteorder::{BigEndian, ReadBytesExt};
+use ss::rc4::Rc4;
+use ss::stream::{CryptoRead, CryptoWrite};
 use std::io::{self, BufReader, Cursor, Error, ErrorKind, Read, Write};
 use std::net::{
     IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs,
 };
 use std::thread;
 use structopt::StructOpt;
-
-use crate::rc4::Rc4;
-use crate::stream::{CryptoRead, CryptoWrite};
 
 const SOCKS5_VER: u8 = 5;
 const CMD_BIND: u8 = 1;

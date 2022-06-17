@@ -38,6 +38,7 @@ impl<R: Read> Read for CryptoRead<R> {
         }
         let n = self.conn_r.read(buf)?;
         if n > 0 {
+            // decrypt
             self.dec.crypt_inplace(buf[..n].as_mut())
         }
         println!("read {} byte", n);
@@ -75,13 +76,12 @@ impl<W: Write> Write for CryptoWrite<W> {
             self.enc.init(&iv[..]);
         }
         let mut data: Vec<u8> = Vec::new();
-        // encrypt
         if let Some(mut iv) = iv_o {
             println!("append iv {:?}", iv);
             data.append(&mut iv);
         }
         let mut buf = buf.to_vec();
-        println!("encrypt!!!!!!!");
+        // encrypt
         self.enc.crypt_inplace(&mut buf[..]);
         data.append(&mut buf);
         println!("write data {:?}", data);
