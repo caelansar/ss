@@ -1,9 +1,11 @@
 use crate::rc4::Rc4;
+use bytes::{BufMut, BytesMut};
 use rand::Rng;
 use std::{
-    io::{Read, Write},
+    io::{Error, Read, Write},
     ops::Deref,
 };
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 const IV_LEN: usize = 16;
 
@@ -97,4 +99,78 @@ impl<W: Write> Write for CryptoWrite<W> {
 fn generate_iv() -> Vec<u8> {
     let random_bytes = rand::thread_rng().gen::<[u8; IV_LEN]>();
     random_bytes.to_vec()
+}
+
+pub struct Rc4Writer<S: AsyncWrite + Unpin> {
+    w: S,
+    inner: Option<Rc4>,
+}
+
+pub struct Rc4Reader<S: AsyncRead + Unpin> {
+    r: S,
+    inner: Option<Rc4>,
+}
+
+impl<S: AsyncWrite + Unpin> Rc4Writer<S> {
+    pub fn new(w: S, inner: Option<Rc4>) -> Self {
+        Self { w, inner }
+    }
+    pub async fn encrypt(&mut self, buf: &mut [u8]) -> Result<(), Error> {
+        if let Some(ref mut inner) = self.inner {
+            println!("encrypt>>>");
+            inner.crypt_inplace(buf.as_mut());
+        }
+        Ok(())
+    }
+    pub async fn write(&mut self, buf: &mut [u8]) -> Result<(), Error> {
+        if let Some(ref mut inner) = self.inner {
+            if !inner.is_init() {
+                let iv = generate_iv();
+                println!("init enc, iv: {:?}", iv);
+                inner.init(&iv[..]);
+                let mut data = BytesMut::new();
+                data.put_slice(&iv);
+                inner.crypt_inplace(&mut buf[..]);
+                data.put_slice(&buf);
+                let n = self.w.write(&data).await?;
+                println!("write data {:?}, n:{}", data, n);
+                return Ok(());
+            }
+        }
+        self.encrypt(buf).await?;
+        self.w.write_all(&buf).await?;
+        Ok(())
+    }
+}
+
+impl<S: AsyncRead + Unpin> Rc4Reader<S> {
+    pub fn new(r: S, inner: Option<Rc4>) -> Self {
+        Self { r, inner }
+    }
+    pub async fn decrypt(&mut self, buf: &mut [u8]) -> Result<(), Error> {
+        if let Some(ref mut inner) = self.inner {
+            inner.crypt_inplace(buf.as_mut());
+        } else {
+            println!("decryptor is none")
+        }
+        Ok(())
+    }
+
+    pub async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
+        if let Some(ref mut inner) = self.inner {
+            if !inner.is_init() {
+                println!("init dec");
+                let mut iv = [0; 16];
+                self.r.read_exact(&mut iv).await?;
+                println!("read iv: {:?}", iv);
+                inner.init(&iv[..]);
+            }
+        }
+        let len = self.r.read(&mut buf[..]).await?;
+        if len != 0 {
+            println!("decrypt");
+            self.decrypt(&mut buf[..len]).await?;
+        }
+        Ok(len)
+    }
 }

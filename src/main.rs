@@ -1,12 +1,10 @@
-use byteorder::{BigEndian, ReadBytesExt};
 use ss::rc4::Rc4;
-use ss::stream::{CryptoRead, CryptoWrite};
-use std::io::{self, BufReader, Cursor, Error, ErrorKind, Read, Write};
-use std::net::{
-    IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs,
-};
-use std::thread;
+use ss::stream::{Rc4Reader, Rc4Writer};
+use std::io::{Cursor, Error, ErrorKind};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use structopt::StructOpt;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 
 const SOCKS5_VER: u8 = 5;
 const CMD_BIND: u8 = 1;
@@ -30,53 +28,43 @@ struct Cfg {
     password: String,
 }
 
-fn handle_client(stream: TcpStream, cfg: Cfg) -> Result<(), Error> {
-    handshake(stream.try_clone()?)?;
-    connect(stream.try_clone()?, cfg)?;
+async fn handle(mut stream: TcpStream, cfg: Cfg) -> Result<(), Error> {
+    // handshake
+    // +----+----------+----------+
+    // |VER | NMETHODS | METHODS  |
+    // +----+----------+----------+
+    // | 1  |    1     | 1 to 255 |
+    // +----+----------+----------+
 
-    Ok(())
-}
-
-// +----+----------+----------+
-// |VER | NMETHODS | METHODS  |
-// +----+----------+----------+
-// | 1  |    1     | 1 to 255 |
-// +----+----------+----------+
-
-// +----+--------+
-// |VER | METHOD |
-// +----+--------+
-// | 1  |   1    |
-// +----+--------+
-fn handshake(stream: TcpStream) -> Result<(), Error> {
-    let mut buf_reader = BufReader::new(stream);
-    let ver = buf_reader.read_u8()?;
+    // +----+--------+
+    // |VER | METHOD |
+    // +----+--------+
+    // | 1  |   1    |
+    // +----+--------+
+    let ver = stream.read_u8().await?;
     if ver != SOCKS5_VER {
         return Err(Error::new(ErrorKind::Other, "not supported ver"));
     }
-    let methods = buf_reader.read_u8()?;
+    let methods = stream.read_u8().await?;
     let mut buf = vec![0; methods as usize];
-    buf_reader.read_exact(&mut buf[..])?;
+    stream.read_exact(&mut buf[..]).await?;
 
-    buf_reader.get_mut().write([SOCKS5_VER, 0].as_ref())?;
-    Ok(())
-}
+    stream.write([SOCKS5_VER, 0].as_ref()).await?;
 
-// +----+-----+-------+------+----------+----------+
-// |VER | CMD |  RSV  | ATYP | DST.ADDR | DST.PORT |
-// +----+-----+-------+------+----------+----------+
-// | 1  |  1  | X'00' |  1   | Variable |    2     |
-// +----+-----+-------+------+----------+----------+
+    // connect
+    // +----+-----+-------+------+----------+----------+
+    // |VER | CMD |  RSV  | ATYP | DST.ADDR | DST.PORT |
+    // +----+-----+-------+------+----------+----------+
+    // | 1  |  1  | X'00' |  1   | Variable |    2     |
+    // +----+-----+-------+------+----------+----------+
 
-// +----+-----+-------+------+----------+----------+
-// |VER | REP |  RSV  | ATYP | BND.ADDR | BND.PORT |
-// +----+-----+-------+------+----------+----------+
-// | 1  |  1  | X'00' |  1   | Variable |    2     |
-// +----+-----+-------+------+----------+----------+
-fn connect(mut stream: TcpStream, cfg: Cfg) -> Result<(), Error> {
-    let mut reader = BufReader::new(&stream);
+    // +----+-----+-------+------+----------+----------+
+    // |VER | REP |  RSV  | ATYP | BND.ADDR | BND.PORT |
+    // +----+-----+-------+------+----------+----------+
+    // | 1  |  1  | X'00' |  1   | Variable |    2     |
+    // +----+-----+-------+------+----------+----------+
     let mut buf = [0; 4];
-    reader.read_exact(&mut buf)?;
+    stream.read_exact(&mut buf).await?;
     let (ver, cmd, atype) = (buf[0], buf[1], buf[3]);
     if ver != SOCKS5_VER {
         return Err(Error::new(ErrorKind::Other, "not supported ver"));
@@ -89,37 +77,37 @@ fn connect(mut stream: TcpStream, cfg: Cfg) -> Result<(), Error> {
     let mut raw_addr = vec![atype];
     let addr = match atype {
         ATYP_IPV4 => {
-            reader.read_exact(&mut buf)?;
+            stream.read_exact(&mut buf).await?;
             let ipv4 = IpAddr::V4(Ipv4Addr::new(buf[0], buf[1], buf[2], buf[3]));
             raw_addr.append(&mut buf[..].to_owned());
             let mut buf = [0; 2];
-            reader.read_exact(&mut buf)?;
+            stream.read_exact(&mut buf).await?;
             raw_addr.append(&mut buf[..].to_owned());
-            let port = Cursor::new(&buf).read_u16::<BigEndian>()?;
+            let port = Cursor::new(&buf).read_u16().await?;
             Ok(SocketAddr::new(ipv4, port))
         }
         ATYPE_IPV6 => {
             let mut buf = [0; 18];
-            reader.read_exact(&mut buf)?;
+            stream.read_exact(&mut buf).await?;
             raw_addr.append(&mut buf[..].to_owned());
             let ipv6 = IpAddr::V6(Ipv6Addr::new(
-                Cursor::new(&buf[0..2]).read_u16::<BigEndian>()?,
-                Cursor::new(&buf[2..4]).read_u16::<BigEndian>()?,
-                Cursor::new(&buf[4..6]).read_u16::<BigEndian>()?,
-                Cursor::new(&buf[6..8]).read_u16::<BigEndian>()?,
-                Cursor::new(&buf[8..10]).read_u16::<BigEndian>()?,
-                Cursor::new(&buf[10..12]).read_u16::<BigEndian>()?,
-                Cursor::new(&buf[12..14]).read_u16::<BigEndian>()?,
-                Cursor::new(&buf[14..16]).read_u16::<BigEndian>()?,
+                Cursor::new(&buf[0..2]).read_u16().await?,
+                Cursor::new(&buf[2..4]).read_u16().await?,
+                Cursor::new(&buf[4..6]).read_u16().await?,
+                Cursor::new(&buf[6..8]).read_u16().await?,
+                Cursor::new(&buf[8..10]).read_u16().await?,
+                Cursor::new(&buf[10..12]).read_u16().await?,
+                Cursor::new(&buf[12..14]).read_u16().await?,
+                Cursor::new(&buf[14..16]).read_u16().await?,
             ));
-            let port = Cursor::new(&buf[16..]).read_u16::<BigEndian>()?;
+            let port = Cursor::new(&buf[16..]).read_u16().await?;
             Ok(SocketAddr::new(ipv6, port))
         }
         ATYPE_HOST => {
-            let host_byte = reader.read_u8()?;
+            let host_byte = stream.read_u8().await?;
             raw_addr.push(host_byte);
             let mut buf = vec![0; host_byte as usize];
-            reader.read_exact(&mut buf)?;
+            stream.read_exact(&mut buf).await?;
             raw_addr.append(&mut buf[..].to_owned());
             Ok(String::from_utf8_lossy(&buf[..])
                 .to_socket_addrs()?
@@ -129,83 +117,79 @@ fn connect(mut stream: TcpStream, cfg: Cfg) -> Result<(), Error> {
         _ => Err(Error::new(ErrorKind::Other, "not supported atype")),
     };
 
-    stream.write(&[SOCKS5_VER, 0, 0, 1, 0, 0, 0, 0, 0, 0])?;
+    stream
+        .write(&[SOCKS5_VER, 0, 0, 1, 0, 0, 0, 0, 0, 0])
+        .await?;
 
     println!("start proxying");
-    let mut stream_c = stream.try_clone()?;
     println!(
         "raw addr {:?}, proxy addr: {} by {}",
         raw_addr, addr?, cfg.server_addr
     );
 
     // proxy addr
-    let dest = TcpStream::connect(cfg.server_addr)?;
-    let dest_c = dest.try_clone()?;
-    let mut thread_vec: Vec<thread::JoinHandle<()>> = Vec::new();
-    // dest.set_nonblocking(true)?;
+    let upstream = TcpStream::connect(cfg.server_addr).await?;
 
-    let mut conn_r = CryptoRead::new(dest, Box::new(Rc4::new(&cfg.password.as_bytes())));
-    let mut conn_w = CryptoWrite::new(dest_c, Box::new(Rc4::new(&cfg.password.as_bytes())));
-    conn_w.write(&raw_addr)?;
+    let encryptor = Rc4::new(&cfg.password.as_bytes());
+    let decryptor = Rc4::new(&cfg.password.as_bytes());
 
-    // let handle = thread::spawn(move || copy(stream, dest));
-    // thread_vec.push(handle);
+    let (rl, wl) = stream.into_split();
+    let (ru, wu) = upstream.into_split();
 
-    // let handle = thread::spawn(move || copy(dest_c, stream_c));
-    // thread_vec.push(handle);
+    let mut ru = Rc4Reader::new(ru, Some(decryptor));
+    let mut wl = Rc4Writer::new(wl, None);
 
-    let handle = thread::spawn(move || match io::copy(&mut stream, &mut conn_w) {
-        Ok(u) => println!("reader: stream, writer conn. copy {}", u),
-        Err(e) => {
-            println!("reader: stream, writer conn. err {}", e);
-            conn_w.shutdown(Shutdown::Both).unwrap();
-            stream.shutdown(Shutdown::Both).unwrap();
-            drop(stream);
-            drop(conn_w);
-        }
+    let mut rl = Rc4Reader::new(rl, None);
+    let mut wu = Rc4Writer::new(wu, Some(encryptor));
+
+    // write addr first
+    wu.write(raw_addr.as_mut_slice()).await?;
+
+    // copy bidirectional
+    tokio::spawn(async move {
+        // read from local and write to upstream
+        copy1(&mut rl, &mut wu).await.unwrap();
     });
-    thread_vec.push(handle);
 
-    let handle = thread::spawn(move || match io::copy(&mut conn_r, &mut stream_c) {
-        Ok(u) => println!("reader conn, writer stream. copy {}", u),
-        Err(e) => {
-            println!("reader conn, writer stream. err {}", e);
-            conn_r.shutdown(Shutdown::Both).unwrap();
-            stream_c.shutdown(Shutdown::Both).unwrap();
-            drop(stream_c);
-            drop(conn_r);
+    // read from upstream and write to local
+    copy1(&mut ru, &mut wl).await.unwrap();
+    Ok(())
+}
+
+async fn copy1<'a, T: AsyncRead + Unpin, U: AsyncWrite + Unpin>(
+    reader: &'a mut Rc4Reader<T>,
+    writer: &'a mut Rc4Writer<U>,
+) -> Result<(), Error> {
+    let mut buf = [0; 1024];
+    loop {
+        let len = reader.read(&mut buf[..]).await?;
+
+        if len == 0 {
+            println!("break");
+            break;
+        } else {
+            println!("read {} bytes", len);
         }
-    });
-    thread_vec.push(handle);
 
-    for handle in thread_vec {
-        handle.join().unwrap();
+        writer.write(&mut buf[..len]).await?
     }
     Ok(())
 }
 
-fn main() -> std::io::Result<()> {
+#[tokio::main]
+async fn main() -> std::io::Result<()> {
     let cfg = Cfg::from_args();
-    println!("{:#?}", cfg);
+    println!("config: {:#?}", cfg);
 
     println!("listening {}", cfg.local_addr);
-    let listener = TcpListener::bind(&cfg.local_addr)?;
-    let mut thread_vec: Vec<thread::JoinHandle<()>> = Vec::new();
+    let listener = TcpListener::bind(&cfg.local_addr).await?;
 
-    for stream in listener.incoming() {
-        println!("receive incoming connection");
-        let stream = stream?;
+    loop {
+        let (stream, addr) = listener.accept().await?;
         let cfg = cfg.clone();
-        let handle = thread::spawn(move || {
-            handle_client(stream, cfg).unwrap_or_else(|error| eprintln!("{:?}", error));
+        println!("client {:?} connected", addr);
+        tokio::spawn(async move {
+            handle(stream, cfg).await.unwrap();
         });
-
-        thread_vec.push(handle);
     }
-
-    for handle in thread_vec {
-        handle.join().unwrap();
-    }
-
-    Ok(())
 }
